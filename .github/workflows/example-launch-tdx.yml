@@ -1,0 +1,92 @@
+# Example: Using launch-tdx action for persistent TDX VMs
+#
+# This workflow demonstrates how to:
+# 1. Launch a persistent TDX VM
+# 2. Run initial docker-compose setup
+# 3. Register with web admin
+#
+# Prerequisites:
+# - Self-hosted runner with TDX enabled (label: tdx)
+# - TDX VM image built with ./vm_images/build_image.sh
+# - Web admin running (optional, for registration)
+
+name: Example - TDX Launch
+
+on:
+  workflow_dispatch:
+    inputs:
+      vm_name:
+        description: 'Name for the VM'
+        default: 'my-service'
+        required: true
+      memory_gb:
+        description: 'Memory in GB'
+        default: '8'
+        required: true
+
+jobs:
+  launch-service:
+    runs-on: [self-hosted, tdx]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Launch persistent TDX VM
+        id: tdx
+        uses: ./.github/actions/launch-tdx
+        with:
+          vm_name: ${{ github.event.inputs.vm_name }}
+          docker_compose_path: './examples/sample-app/docker-compose.yml'
+          vm_memory_gb: ${{ github.event.inputs.memory_gb }}
+          vm_cpus: '4'
+          labels: 'production,web'
+          admin_url: 'http://localhost:8080'
+          admin_password: ${{ secrets.ADMIN_PASSWORD }}
+
+      - name: Display VM information
+        run: |
+          echo "========================================="
+          echo "TDX VM Launched Successfully"
+          echo "========================================="
+          echo "VM ID:          ${{ steps.tdx.outputs.vm_id }}"
+          echo "VM Name:        ${{ steps.tdx.outputs.vm_name }}"
+          echo "SSH Port:       ${{ steps.tdx.outputs.ssh_port }}"
+          echo "Management URL: ${{ steps.tdx.outputs.management_url }}"
+          echo ""
+          echo "Connect with:"
+          echo "  ssh -p ${{ steps.tdx.outputs.ssh_port }} ubuntu@<host>"
+          echo ""
+          echo "Delete with:"
+          echo "  tdvirsh delete ${{ steps.tdx.outputs.vm_name }}"
+
+      - name: Verify VM is running
+        run: |
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+          ssh $SSH_OPTS -p ${{ steps.tdx.outputs.ssh_port }} ubuntu@localhost "
+            echo 'VM is accessible'
+            docker ps
+            free -h
+            df -h
+          "
+
+      - name: Save VM info as artifact
+        run: |
+          mkdir -p vm-info
+          cat > vm-info/vm-details.json << EOF
+          {
+            "vm_id": "${{ steps.tdx.outputs.vm_id }}",
+            "vm_name": "${{ steps.tdx.outputs.vm_name }}",
+            "ssh_port": "${{ steps.tdx.outputs.ssh_port }}",
+            "management_url": "${{ steps.tdx.outputs.management_url }}",
+            "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "github_run_id": "${{ github.run_id }}"
+          }
+          EOF
+
+      - name: Upload VM info
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-info
+          path: vm-info/
+          retention-days: 30

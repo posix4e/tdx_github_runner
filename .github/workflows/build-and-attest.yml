@@ -1,0 +1,122 @@
+# Build TDX base image and publish attestation
+# The image stays on the self-hosted runner, only attestation is published
+
+name: Build and Attest Base Image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'vm_images/**'
+      - 'scripts/**'
+      - '.github/workflows/build-and-attest.yml'
+  workflow_dispatch:
+
+jobs:
+  build-and-attest:
+    runs-on: [self-hosted, tdx]
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup dependencies
+        run: |
+          ./scripts/setup_host.sh install
+          echo "$PWD/bin" >> $GITHUB_PATH
+
+      - name: Build base image
+        id: build
+        run: |
+          ./vm_images/build_image.sh
+
+          IMAGE_PATH="vm_images/output/tdx-runner.qcow2"
+          IMAGE_HASH=$(sha256sum "$IMAGE_PATH" | awk '{print $1}')
+          IMAGE_SIZE=$(stat -c%s "$IMAGE_PATH")
+
+          echo "image_hash=$IMAGE_HASH" >> $GITHUB_OUTPUT
+          echo "image_size=$IMAGE_SIZE" >> $GITHUB_OUTPUT
+          echo "Image hash: $IMAGE_HASH"
+          echo "Image size: $IMAGE_SIZE bytes"
+
+          # Copy to persistent path for test workflows to reuse
+          PERSISTENT_DIR="/home/ubuntu/src/tdx_github_runner/vm_images/output"
+          mkdir -p "$PERSISTENT_DIR"
+          cp "$IMAGE_PATH" "$PERSISTENT_DIR/"
+          echo "Copied image to persistent path: $PERSISTENT_DIR/tdx-runner.qcow2"
+
+      - name: Generate TDX attestation
+        id: attest
+        run: |
+          cd deps/tdx/guest-tools
+
+          # Launch VM
+          VM_OUTPUT=$(./tdvirsh new -i "$GITHUB_WORKSPACE/vm_images/output/tdx-runner.qcow2" 2>&1)
+          VM_NAME=$(echo "$VM_OUTPUT" | grep -oP 'Name:\s+\K\S+' | head -1)
+          echo "vm_name=$VM_NAME" >> $GITHUB_OUTPUT
+          echo "Launched VM: $VM_NAME"
+
+          # Wait for boot
+          sleep 45
+
+          # Get VM IP
+          VM_IP=$(virsh domifaddr "$VM_NAME" --source lease 2>/dev/null | grep -oP '192\.168\.\d+\.\d+' | head -1)
+          echo "VM IP: $VM_IP"
+
+          if [ -n "$VM_IP" ]; then
+            SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30"
+
+            # Check TDX availability
+            MEASUREMENTS=$(sshpass -p '123456' ssh $SSH_OPTS tdx@$VM_IP "
+              echo '{\"tsm_available\": '
+              if [ -d /sys/kernel/config/tsm/report ]; then
+                echo 'true'
+              else
+                echo 'false'
+              fi
+              echo ', \"docker_version\": \"'\$(docker --version 2>/dev/null | cut -d' ' -f3 | tr -d ',')'\"}'
+            " 2>/dev/null | tr -d '\n' || echo '{"error": "ssh_failed"}')
+
+            echo "measurements=$MEASUREMENTS" >> $GITHUB_OUTPUT
+          else
+            echo 'measurements={"error": "no_ip"}' >> $GITHUB_OUTPUT
+          fi
+
+          # Cleanup VM
+          ./tdvirsh delete "$VM_NAME" 2>/dev/null || virsh destroy "$VM_NAME" 2>/dev/null || true
+
+      - name: Create attestation file
+        run: |
+          mkdir -p attestation-output
+          cat > attestation-output/base_image_attestation.json << EOF
+          {
+            "attestation_id": "base-${{ github.run_id }}",
+            "attestation_type": "base_image",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "image": {
+              "name": "tdx-runner.qcow2",
+              "sha256": "${{ steps.build.outputs.image_hash }}",
+              "size_bytes": ${{ steps.build.outputs.image_size }}
+            },
+            "tdx_measurements": ${{ steps.attest.outputs.measurements }},
+            "github": {
+              "run_id": "${{ github.run_id }}",
+              "sha": "${{ github.sha }}",
+              "ref": "${{ github.ref }}"
+            },
+            "verification": {
+              "note": "Image stored on self-hosted runner. Consumers verify MRTD matches at runtime."
+            }
+          }
+          EOF
+
+          cat attestation-output/base_image_attestation.json
+
+      - name: Upload attestation artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: base-image-attestation
+          path: attestation-output/base_image_attestation.json
+          retention-days: 90

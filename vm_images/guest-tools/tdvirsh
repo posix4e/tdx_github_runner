@@ -1,0 +1,322 @@
+#!/bin/bash
+#
+# Wrapper around virsh to ease the creation of TDs
+#
+
+# This file is part of Canonical's TDX repository which includes tools
+# to setup and configure a confidential computing environment
+# based on Intel TDX technology.
+# See the LICENSE file in the repository for the license text.
+
+# Copyright 2024 Canonical Ltd.
+# SPDX-License-Identifier: GPL-3.0-only
+
+# This program is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License version 3,
+# as published by the Free Software Foundation.
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranties
+# of MERCHANTABILITY, SATISFACTORY QUALITY, or FITNESS FOR A PARTICULAR PURPOSE.
+# See the GNU General Public License for more details.
+
+##
+# Global constants
+#
+DOMAIN_PREFIX="tdvirsh"
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
+SCRIPT_NAME=$(basename "$0")
+UBUNTU_VERSION=$(lsb_release -rs)
+BASE_IMG_DEFAULT=${SCRIPT_DIR}/image/tdx-guest-ubuntu-${UBUNTU_VERSION}-generic.qcow2
+XML_TEMPLATE_DEFAULT=${SCRIPT_DIR}/trust_domain.xml.template
+WORKDIR_PATH=/var/tmp/tdvirsh/
+
+##
+# Global variables
+#
+overlay_image_path=${WORKDIR_PATH}/overlay.${domain}.qcow2
+base_img_path=$(realpath ${BASE_IMG_DEFAULT})
+xml_template_path=$(realpath ${XML_TEMPLATE_DEFAULT})
+xml_template_shared_path=${SCRIPT_DIR}/trust_domain_shared.xml.template
+share_dir=""
+created_domain=""
+
+usage() {
+    cat <<EOM
+Usage: ./$(basename "${BASH_SOURCE[0]}") [-h] [new] [delete D] [list]
+
+Manage Trust Domains (TDs) using libvirt.
+
+Available options:
+
+new [--td-image|-i PATH] [--xml-template|-t PATH] [--share-dir|-s PATH]
+                            Run a Trust Domain (TD)
+                                Default TD image path: ./image/tdx-guest-ubuntu-${UBUNTU_VERSION}-generic.qcow2
+                                Default XML template path: ./trust_domain.xml.template
+                                --share-dir: Host directory to share with VM via virtio-fs
+                                             (mounted at /mnt/share in guest)
+delete <domain|all>         Stop and delete Trust Domain (TD)
+                               <domain> should be a valid domain name
+                               <all> delete all VMs
+list                        List all VMs
+-h,   --help                Print this help and exit
+
+All other options will be passed to virsh. To see virsh usage run:
+    virsh --help
+
+EOM
+}
+
+attach_gpus() {
+    if [ -z "$1" ]; then
+	return
+    fi
+    prepare_gpus "$1"
+    build_hostdevs_xml "$1"
+}
+
+prepare_gpus() {
+    sudo ${SCRIPT_DIR}/../gpu-cc/h100/setup-gpus.sh "$1" &> /dev/null
+    # increase the amount of locked memory limit
+    echo 0x200000 | sudo tee /sys/module/vfio_iommu_type1/parameters/dma_entry_limit
+}
+
+build_hostdevs_xml() {
+    local pci_list="$1"
+    IFS=',' read -ra bdfs <<< "$pci_list"
+    for bdf in "${bdfs[@]}"; do
+        if [[ "$bdf" =~ ^([0-9a-fA-F]{4}):([0-9a-fA-F]{2}):([0-9a-fA-F]{2})\.([0-7])$ ]]; then
+            domain="${BASH_REMATCH[1]}"
+            bus="${BASH_REMATCH[2]}"
+            slot="${BASH_REMATCH[3]}"
+            func="${BASH_REMATCH[4]}"
+
+	    read -r -d '' hostdev << EOM
+<hostdev mode='subsystem' type='pci' managed='yes'>
+  <source>
+      <address domain='${domain}' bus='0x${bus}' slot='0x${slot}' function='0x${func}'/>
+  </source>
+</hostdev>
+EOM
+	    HOSTDEVS="${HOSTDEVS}\n${hostdev}"
+        else
+            echo "Invalid BDF format: $bdf"
+        fi
+    done
+}
+
+check_input_paths() {
+    error=0
+    if [ $? -ne 0 ] || [ ! -f ${base_img_path} ]; then
+        echo "TD image not found at path '${base_img_path}'."
+        echo "Set TD image path via command line option."
+        error=1
+    fi
+    if [ $? -ne 0 ] || [ ! -f ${xml_template_path} ]; then
+        echo "libvirt guest XML template not found at path '${xml_template_path}'."
+        echo "Set libvirt guest XML template path via command line option."
+        error=1
+    fi
+    if [ $error -ne 0 ]; then
+        exit 1
+    fi
+}
+
+create_overlay_image() {
+    local rand_str=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c15)
+    mkdir -p $WORKDIR_PATH || true
+    overlay_image_path=${WORKDIR_PATH}/overlay.${rand_str}.qcow2
+    qemu-img create \
+        -f qcow2 \
+        -F qcow2 \
+        -b ${base_img_path} \
+        ${overlay_image_path} >/dev/null
+}
+
+create_domain_xml() {
+    awk -v img_path=${base_img_path} \
+        -v domain=${DOMAIN_PREFIX} \
+        -v hostdevs="${HOSTDEVS}" \
+        -v overlay_path=${overlay_image_path} \
+        -v shared_dir="${share_dir}" '
+        {
+  gsub("BASE_IMG_PATH", img_path, $0);
+  gsub("DOMAIN", domain, $0);
+  gsub("OVERLAY_IMG_PATH", overlay_path, $0);
+  gsub("HOSTDEV_DEVICES", hostdevs, $0);
+  gsub("SHARED_DIR", shared_dir, $0);
+  print;
+        }
+  ' ${xml_template_path} > ${WORKDIR_PATH}/${DOMAIN_PREFIX}.xml
+}
+
+boot_vm() {
+    virsh define ${WORKDIR_PATH}/${DOMAIN_PREFIX}.xml >/dev/null
+
+    # determine extra domain prefix
+    xml_template_path_fn=${xml_template_path##*/}
+    domain_prefix_extra=${xml_template_path_fn%.xml*}
+    if [ -z "$domain_prefix_extra" ]; then
+        domain_prefix_extra="td_guest"
+    fi
+
+    created_domain=${DOMAIN_PREFIX}-${domain_prefix_extra}-$(virsh domuuid ${DOMAIN_PREFIX})
+    mv ${WORKDIR_PATH}/{${DOMAIN_PREFIX}.xml,${created_domain}.xml} &>/dev/null || true
+    virsh domrename ${DOMAIN_PREFIX} ${created_domain} >/dev/null
+    virsh start ${created_domain} >/dev/null
+}
+
+destroy() {
+    local domain_to_destroy="${1}"
+    local qcow2_overlay_path
+
+    # sanity check
+    if ! virsh dominfo ${domain_to_destroy} &> /dev/null ; then
+        echo "Problem trying to assess domain : ${domain_to_destroy}"
+        exit 1
+    fi
+
+    qcow2_overlay_path=$(virsh dumpxml ${domain_to_destroy} |
+        grep -o "${WORKDIR_PATH}\/overlay\.[A-Za-z0-9]*\.qcow2")
+
+    echo "Destroying domain ${domain_to_destroy}"
+
+    virsh shutdown ${domain_to_destroy} &>/dev/null
+    virsh shutdown --domain ${domain_to_destroy} &>/dev/null
+
+    echo "Waiting for VM to shutdown ..."
+    sleep 5
+
+    virsh destroy ${domain_to_destroy} &>/dev/null
+    virsh destroy --domain ${domain_to_destroy} &>/dev/null
+    virsh undefine ${domain_to_destroy} &>/dev/null
+
+    rm -f ${qcow2_overlay_path} ${WORKDIR_PATH}/${domain_to_destroy}.xml
+}
+
+clean_all() {
+    for domain_to_clean in $(virsh list --all --name | grep ${DOMAIN_PREFIX}); do
+        destroy ${domain_to_clean}
+    done
+    rm -rf ${WORKDIR_PATH}
+}
+
+print_all() {
+    while read -r line
+    do
+        local extra_info=""
+        local td_domain=$(echo $line | grep -oP "${DOMAIN_PREFIX}-[^ ]+")
+        if [ ! -z "$td_domain" ]; then
+            host_port=$(
+                virsh \
+                    qemu-monitor-command ${td_domain} \
+                    --hmp info usernet 2>&1 |
+                    awk '/HOST_FORWARD/ {print $4}'
+                     )
+            guest_cid=$(
+                virsh \
+                    qemu-monitor-command ${td_domain} \
+                    --hmp info qtree 2>&1 |
+                    awk '/guest-cid/ {print $3}'
+                     )
+            host_ip=$(
+               virsh domifaddr ${td_domain} 2>&1 |
+                    awk '/vnet/ {print $4}'
+                     )
+            if [[ "${host_ip}" != */* ]]; then
+                host_ip="unknown"
+            else
+                host_ip="${host_ip%/*}"
+            fi
+            extra_info="(ip:${host_ip}, hostfwd:$host_port, cid:${guest_cid})"
+        fi
+        echo "$line $extra_info"
+    done < <(virsh "list --all")
+}
+
+run_td() {
+    echo "Create and run new virsh domain from ${base_img_path} and ${xml_template_path} "
+    echo "---"
+    attach_gpus ${gpus}
+    check_input_paths
+    create_overlay_image
+    create_domain_xml
+    boot_vm
+    virsh dominfo "${created_domain}"
+}
+
+parse_params() {
+    while :; do
+        case "${1-}" in
+        "" | -h | --help)
+            usage
+            exit 0
+            ;;
+        new)
+            shift
+            while :; do
+                case "${1-}" in
+                    -i | --td-image)
+                        base_img="${2-}"
+                        shift 2
+                        ;;
+                    -t | --xml-template)
+                        xml_template="${2-}"
+                        shift 2
+                        ;;
+                    -g | --gpus)
+                        gpus="${2-}"
+                        shift 2
+                        ;;
+                    -s | --share-dir)
+                        share_dir="${2-}"
+                        shift 2
+                        ;;
+                    "")
+                        break
+                        ;;
+                    *)
+                        echo "${SCRIPT_NAME}: unrecognized option '${1-}'. See '${SCRIPT_NAME} -h'."
+                        exit 1
+                        ;;
+                esac
+            done
+            [ -n "${base_img}" ] && base_img_path=$(realpath "${base_img}")
+            [ -n "${xml_template}" ] && xml_template_path=$(realpath "${xml_template}")
+            # If share_dir is specified and no xml_template is set, use the shared template
+            if [ -n "${share_dir}" ] && [ -z "${xml_template}" ]; then
+                if [ -f "${xml_template_shared_path}" ]; then
+                    xml_template_path=$(realpath "${xml_template_shared_path}")
+                fi
+                # Ensure share_dir is an absolute path
+                share_dir=$(realpath "${share_dir}")
+            fi
+            run_td
+            exit 0
+            ;;
+        list)
+            print_all
+            exit 0
+            ;;
+        delete)
+            domain_to_clean="${2-}"
+            if [ "${domain_to_clean}" == "all" ]; then
+                clean_all
+            else
+                if [[ ! "${domain_to_clean}" =~ ^${DOMAIN_PREFIX}-[^\ ]+$ ]]; then
+                    usage
+                    exit 0
+                fi
+                destroy ${domain_to_clean}
+            fi
+            exit 0
+            ;;
+        *)
+            # call virsh for everything else
+            exec virsh "$@"
+            ;;
+        esac
+        shift
+    done
+}
+
+parse_params "$@"

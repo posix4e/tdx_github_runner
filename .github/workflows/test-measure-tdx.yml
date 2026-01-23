@@ -1,0 +1,80 @@
+# Test workflow for measure-tdx action
+name: Test Measure TDX
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-measure:
+    runs-on: [self-hosted, tdx]
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup dependencies
+        run: |
+          ./scripts/setup_host.sh install
+          echo "$PWD/bin" >> $GITHUB_PATH
+
+      - name: Create test docker-compose
+        run: |
+          mkdir -p test-workload
+          # Create a simple web service using Python's http.server
+          # Uses a shell script to avoid YAML multiline issues with Python
+          cat > test-workload/docker-compose.yml << 'EOF'
+          services:
+            mock-attest:
+              image: python:3.11-alpine
+              ports:
+                - "8080:8080"
+              command: ["python", "-c", "import http.server,json\nclass H(http.server.BaseHTTPRequestHandler):\n def do_GET(self):\n  if self.path in ['/attest','/health']:\n   self.send_response(200);self.send_header('Content-Type','application/json');self.end_headers();self.wfile.write(json.dumps({'status':'success','path':self.path}).encode())\n  else:self.send_error(404)\n def log_message(self,*a):pass\nhttp.server.HTTPServer(('',8080),H).serve_forever()"]
+          EOF
+
+      - name: Build or locate image
+        id: image
+        run: |
+          # Check if customized image exists from previous build
+          if [ -f "$GITHUB_WORKSPACE/vm_images/output/tdx-runner.qcow2" ]; then
+            echo "Using existing image from workspace"
+            echo "image_path=$GITHUB_WORKSPACE/vm_images/output/tdx-runner.qcow2" >> $GITHUB_OUTPUT
+          elif [ -f "/home/ubuntu/src/tdx_github_runner/vm_images/output/tdx-runner.qcow2" ]; then
+            echo "Using existing image from persistent path"
+            echo "image_path=/home/ubuntu/src/tdx_github_runner/vm_images/output/tdx-runner.qcow2" >> $GITHUB_OUTPUT
+          else
+            echo "Building customized image..."
+            ./vm_images/build_image.sh
+            echo "image_path=$GITHUB_WORKSPACE/vm_images/output/tdx-runner.qcow2" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run measure-tdx
+        id: measure
+        uses: ./.github/actions/measure-tdx
+        with:
+          docker_compose_path: './test-workload/docker-compose.yml'
+          intel_api_key: ${{ secrets.INTEL_API_KEY }}
+          image_path: ${{ steps.image.outputs.image_path }}
+          vm_memory_gb: '4'
+          vm_cpus: '2'
+          timeout_minutes: '5'
+          # Intel API key now configured - full attestation enabled
+
+      - name: Display results
+        run: |
+          echo "Compose hash: ${{ steps.measure.outputs.compose_hash }}"
+          echo "VM name: ${{ steps.measure.outputs.vm_name }}"
+          echo ""
+          echo "Attestation JSON:"
+          echo '${{ steps.measure.outputs.attestation_json }}' | jq . 2>/dev/null || echo '${{ steps.measure.outputs.attestation_json }}'
+          echo ""
+          # Check for Intel TA token
+          TOKEN=$(echo '${{ steps.measure.outputs.attestation_json }}' | jq -r '.tdx.intel_ta_token // empty' 2>/dev/null)
+          if [ -n "$TOKEN" ]; then
+            echo "Got attestation token from Intel TA"
+            echo "$TOKEN" | head -c 100
+            echo "..."
+          else
+            echo "No attestation token (Intel API key may not be configured)"
+          fi

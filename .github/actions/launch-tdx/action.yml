@@ -1,0 +1,246 @@
+name: 'TDX Launch'
+description: 'Launch a persistent TDX VM via 9P filesystem sharing'
+author: 'TDX GitHub Runner'
+
+branding:
+  icon: 'server'
+  color: 'green'
+
+inputs:
+  vm_name:
+    description: 'Name for the TDX VM (used for identification)'
+    required: true
+  docker_compose_path:
+    description: 'Path to docker-compose.yml for initial setup (optional)'
+    required: false
+    default: ''
+  intel_api_key:
+    description: 'Intel Trust Authority API key (optional for persistent mode)'
+    required: false
+  vm_memory_gb:
+    description: 'VM memory in GB'
+    required: false
+    default: '8'
+  vm_cpus:
+    description: 'Number of VM CPUs'
+    required: false
+    default: '4'
+  image_path:
+    description: 'Path to TDX VM image (defaults to pre-built image)'
+    required: false
+    default: ''
+  compose_up_args:
+    description: 'Arguments for docker compose up'
+    required: false
+    default: '-d'
+  timeout_minutes:
+    description: 'Maximum time to wait for VM to be ready'
+    required: false
+    default: '10'
+
+outputs:
+  vm_name:
+    description: 'Full VM name from tdvirsh'
+    value: ${{ steps.launch.outputs.vm_name }}
+  share_dir:
+    description: 'Shared directory path'
+    value: ${{ steps.setup.outputs.share_dir }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Validate inputs
+      id: validate
+      shell: bash
+      run: |
+        echo "Validating inputs..."
+
+        # Validate VM name
+        if [ -z "${{ inputs.vm_name }}" ]; then
+          echo "::error::vm_name is required"
+          exit 1
+        fi
+
+        # Validate name format (alphanumeric, hyphens, underscores only)
+        if ! [[ "${{ inputs.vm_name }}" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+          echo "::error::vm_name must be alphanumeric with hyphens/underscores only"
+          exit 1
+        fi
+
+        # Validate memory/cpu values
+        if ! [[ "${{ inputs.vm_memory_gb }}" =~ ^[0-9]+$ ]]; then
+          echo "::error::Invalid vm_memory_gb value"
+          exit 1
+        fi
+
+        if ! [[ "${{ inputs.vm_cpus }}" =~ ^[0-9]+$ ]]; then
+          echo "::error::Invalid vm_cpus value"
+          exit 1
+        fi
+
+        # Check compose file if specified
+        if [ -n "${{ inputs.docker_compose_path }}" ] && [ ! -f "${{ inputs.docker_compose_path }}" ]; then
+          echo "::error::Docker compose file not found: ${{ inputs.docker_compose_path }}"
+          exit 1
+        fi
+
+        echo "Inputs validated"
+
+    - name: Create shared directory and config
+      id: setup
+      shell: bash
+      run: |
+        # Create unique shared directory
+        SHARE_DIR="/tmp/tdx-share-$(uuidgen)"
+        mkdir -p "$SHARE_DIR"
+        echo "share_dir=$SHARE_DIR" >> $GITHUB_OUTPUT
+        echo "Created share directory: $SHARE_DIR"
+
+        # Copy compose file if provided
+        if [ -n "${{ inputs.docker_compose_path }}" ]; then
+          COMPOSE_DIR=$(dirname "${{ inputs.docker_compose_path }}")
+          cp "${{ inputs.docker_compose_path }}" "$SHARE_DIR/docker-compose.yml"
+          # Copy any additional files from compose directory (configs, etc)
+          if [ "$COMPOSE_DIR" != "." ]; then
+            for f in "$COMPOSE_DIR"/*; do
+              [ -f "$f" ] && [ "$(basename "$f")" != "docker-compose.yml" ] && cp "$f" "$SHARE_DIR/" 2>/dev/null || true
+            done
+          fi
+          echo "Copied compose file and configs to $SHARE_DIR/"
+        fi
+
+        # Write config.json for persistent mode (no health check or attestation)
+        cat > "$SHARE_DIR/config.json" << EOF
+        {
+          "mode": "persistent",
+          "compose_up_args": "${{ inputs.compose_up_args }}",
+          "intel_api_key": "${{ inputs.intel_api_key }}"
+        }
+        EOF
+
+        echo "Config written to $SHARE_DIR/config.json (persistent mode)"
+
+    - name: Launch TDX VM
+      id: launch
+      shell: bash
+      run: |
+        echo "Launching persistent TDX VM..."
+
+        SHARE_DIR="${{ steps.setup.outputs.share_dir }}"
+
+        # Determine image path
+        IMAGE_PATH="${{ inputs.image_path }}"
+        if [ -z "$IMAGE_PATH" ]; then
+          for path in \
+            "${GITHUB_WORKSPACE}/vm_images/output/tdx-runner.qcow2" \
+            "${TDX_IMAGE_PATH:-/var/lib/tdx/images/tdx-runner.qcow2}" \
+            "$HOME/tdx/guest-tools/image/tdx-guest-ubuntu-24.04-generic.qcow2"; do
+            if [ -f "$path" ]; then
+              IMAGE_PATH="$path"
+              break
+            fi
+          done
+        fi
+
+        if [ ! -f "$IMAGE_PATH" ]; then
+          echo "::error::TDX image not found. Set image_path input or build image first."
+          exit 1
+        fi
+
+        echo "Using image: $IMAGE_PATH"
+
+        # Find tdvirsh
+        TDVIRSH="${GITHUB_WORKSPACE}/vm_images/guest-tools/tdvirsh"
+        if [ ! -f "$TDVIRSH" ]; then
+          TDVIRSH="${GITHUB_WORKSPACE}/deps/tdx/guest-tools/tdvirsh"
+        fi
+        if [ ! -f "$TDVIRSH" ]; then
+          TDVIRSH="$(which tdvirsh 2>/dev/null || echo '')"
+        fi
+        if [ -z "$TDVIRSH" ] || [ ! -f "$TDVIRSH" ]; then
+          echo "::error::tdvirsh not found. Run setup_host.sh first."
+          exit 1
+        fi
+
+        # Launch VM with shared directory
+        echo "Launching TDX VM with shared directory: $SHARE_DIR"
+        VM_OUTPUT=$("$TDVIRSH" new -i "$IMAGE_PATH" --share-dir "$SHARE_DIR" 2>&1) || {
+          echo "::error::Failed to launch TDX VM: $VM_OUTPUT"
+          exit 1
+        }
+
+        # Parse VM name from output
+        VM_NAME=$(echo "$VM_OUTPUT" | grep -oP 'Name:\s+\K\S+' | head -1)
+        if [ -z "$VM_NAME" ]; then
+          VM_NAME=$(echo "$VM_OUTPUT" | grep -oP 'tdvirsh-\S+' | head -1)
+        fi
+
+        if [ -z "$VM_NAME" ]; then
+          echo "::error::Could not determine VM name from: $VM_OUTPUT"
+          exit 1
+        fi
+
+        echo "vm_name=$VM_NAME" >> $GITHUB_OUTPUT
+        echo "$VM_NAME" > /tmp/launch_tdx_vm_name.txt
+        echo "$SHARE_DIR" > /tmp/launch_tdx_share_dir.txt
+
+        echo "TDX VM launched: $VM_NAME"
+
+    - name: Wait for ready
+      id: wait
+      shell: bash
+      run: |
+        SHARE_DIR="${{ steps.setup.outputs.share_dir }}"
+        TIMEOUT_SECS=$(( ${{ inputs.timeout_minutes }} * 60 ))
+        START_TIME=$(date +%s)
+
+        echo "Waiting for VM to be ready..."
+        echo "Polling $SHARE_DIR/status for 'ready'..."
+
+        while true; do
+          CURRENT_TIME=$(date +%s)
+          ELAPSED=$((CURRENT_TIME - START_TIME))
+
+          if [ $ELAPSED -gt $TIMEOUT_SECS ]; then
+            echo "::error::Timeout waiting for VM to be ready"
+            if [ -f "$SHARE_DIR/error.log" ]; then
+              echo "Error log:"
+              cat "$SHARE_DIR/error.log"
+            fi
+            exit 1
+          fi
+
+          # Check for error
+          if [ -f "$SHARE_DIR/error.log" ]; then
+            echo "::error::VM startup failed:"
+            cat "$SHARE_DIR/error.log"
+            exit 1
+          fi
+
+          # Check for ready status
+          STATUS=$(cat "$SHARE_DIR/status" 2>/dev/null || echo "booting")
+          if [ "$STATUS" = "ready" ]; then
+            echo "VM is ready!"
+            break
+          fi
+
+          echo "Status: $STATUS (elapsed: ${ELAPSED}s)"
+          sleep 5
+        done
+
+    - name: Summary
+      shell: bash
+      run: |
+        echo ""
+        echo "========================================="
+        echo "TDX VM Launch Complete"
+        echo "========================================="
+        echo "VM Name:     ${{ steps.launch.outputs.vm_name }}"
+        echo "Share Dir:   ${{ steps.setup.outputs.share_dir }}"
+        echo "========================================="
+        echo ""
+        echo "The VM will persist until explicitly deleted."
+        echo "To delete: virsh destroy ${{ steps.launch.outputs.vm_name }}"
+        echo ""
+        echo "Note: Share directory will be cleaned up on workflow completion."
+        echo "For persistent shared data, copy files to the VM before cleanup."

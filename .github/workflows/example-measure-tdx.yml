@@ -1,0 +1,72 @@
+# Example: Using measure-tdx action for ephemeral TDX workloads
+#
+# This workflow demonstrates how to:
+# 1. Run a docker-compose workload in an ephemeral TDX VM
+# 2. Capture TDX attestation bound to the workload
+# 3. Get Intel Trust Authority JWT verification
+#
+# Prerequisites:
+# - Self-hosted runner with TDX enabled (label: tdx)
+# - TDX VM image built with ./vm_images/build_image.sh
+# - Intel Trust Authority API key (optional, for JWT attestation)
+
+name: Example - TDX Measure
+
+on:
+  workflow_dispatch:
+    inputs:
+      compose_path:
+        description: 'Path to docker-compose.yml'
+        default: './examples/sample-app/docker-compose.yml'
+        required: true
+
+jobs:
+  measure-workload:
+    runs-on: [self-hosted, tdx]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run workload in TDX VM with attestation
+        id: tdx
+        uses: ./.github/actions/measure-tdx
+        with:
+          docker_compose_path: ${{ github.event.inputs.compose_path }}
+          intel_api_key: ${{ secrets.INTEL_API_KEY }}
+          vm_memory_gb: '4'
+          vm_cpus: '2'
+          timeout_minutes: '30'
+
+      - name: Display attestation results
+        run: |
+          echo "VM Name: ${{ steps.tdx.outputs.vm_name }}"
+          echo "Compose Hash: ${{ steps.tdx.outputs.compose_hash }}"
+          echo ""
+          echo "Attestation JSON:"
+          echo '${{ steps.tdx.outputs.attestation_json }}' | jq .
+          echo ""
+          # Check if Intel TA token was received
+          TOKEN=$(echo '${{ steps.tdx.outputs.attestation_json }}' | jq -r '.tdx.intel_ta_token // empty')
+          if [ -n "$TOKEN" ]; then
+            echo "Intel TA Token received (first 50 chars):"
+            echo "$TOKEN" | cut -c1-50
+          else
+            echo "No Intel TA token (API key may not be configured)"
+          fi
+
+      - name: Display MRTD for verification
+        run: |
+          # Get MRTD from this run's attestation
+          # Note: Base image attestations are uploaded as artifacts from the build workflow
+          # You can download and verify against the published MRTD from the build artifacts
+          echo "Attestation JSON:"
+          echo '${{ steps.tdx.outputs.attestation_json }}' | jq .
+
+          # Extract MRTD if available
+          MRTD=$(echo '${{ steps.tdx.outputs.attestation_json }}' | jq -r '.tdx.measurements.mrtd // .tdx.verified_measurements.mrtd // "not available"')
+          echo ""
+          echo "MRTD: $MRTD"
+          echo ""
+          echo "To verify, compare this MRTD against the base_image_attestation.json artifact"
+          echo "from the VM image build workflow."

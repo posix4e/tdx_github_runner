@@ -1,0 +1,58 @@
+# Sample docker-compose for testing TDX workloads
+# This simple app demonstrates attestation capabilities
+
+version: '3.8'
+
+services:
+  # Simple web service that can expose attestation info
+  web:
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Example attestation-aware service
+  # In real use, this would call trustauthority-cli or use TSM interface
+  attestation-checker:
+    image: alpine:latest
+    command: |
+      sh -c '
+        echo "Checking TDX attestation capabilities..."
+
+        # Check for TDX report interface
+        if [ -d /sys/kernel/config/tsm/report ]; then
+          echo "✓ TSM report interface available"
+        else
+          echo "⚠ TSM report interface not found (may need to be mounted)"
+        fi
+
+        # Check for trustauthority-cli
+        if command -v trustauthority-cli &>/dev/null; then
+          echo "✓ trustauthority-cli available"
+        else
+          echo "⚠ trustauthority-cli not found"
+        fi
+
+        echo ""
+        echo "System info:"
+        uname -a
+        cat /proc/cpuinfo | grep -E "model name|flags" | head -4
+
+        echo ""
+        echo "Attestation checker completed"
+        sleep 5
+      '
+    privileged: true
+    volumes:
+      - /sys/kernel/config:/sys/kernel/config:ro
+
+# Networks
+networks:
+  default:
+    driver: bridge

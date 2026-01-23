@@ -1,0 +1,26 @@
+# Dependencies (managed by setup_host.sh)
+deps/
+bin/
+
+# Built images
+vm_images/output/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+*.swp
+*~
+
+# Temp files
+*.tmp
+*.log

@@ -1,0 +1,249 @@
+name: 'TDX Measure'
+description: 'Run docker-compose workload in ephemeral TDX VM with self-attestation via virtio-fs'
+author: 'TDX GitHub Runner'
+
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  intel_api_key:
+    description: 'Intel Trust Authority API key'
+    required: true
+  intel_api_url:
+    description: 'Intel Trust Authority API URL'
+    default: 'https://api.trustauthority.intel.com'
+  docker_compose_path:
+    description: 'Path to docker-compose.yml file'
+    default: './docker-compose.yml'
+  vm_memory_gb:
+    description: 'VM memory in GB'
+    default: '4'
+  vm_cpus:
+    description: 'Number of VM CPUs'
+    default: '2'
+  timeout_minutes:
+    description: 'Maximum time to wait for workload'
+    default: '30'
+  image_path:
+    description: 'Path to TDX VM image (auto-detected if empty)'
+    default: ''
+  compose_up_args:
+    description: 'Arguments for docker compose up'
+    default: '--build -d'
+  health_endpoint:
+    description: 'Health check endpoint (launcher handles attestation)'
+    default: '/health'
+
+outputs:
+  vm_name:
+    description: 'Name of the TDX VM'
+    value: ${{ steps.launch.outputs.vm_name }}
+  share_dir:
+    description: 'Shared directory path'
+    value: ${{ steps.setup.outputs.share_dir }}
+  compose_hash:
+    description: 'SHA256 hash of docker-compose file'
+    value: ${{ steps.setup.outputs.compose_hash }}
+  attestation_json:
+    description: 'Attestation response from app'
+    value: ${{ steps.wait.outputs.attestation_json }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Validate inputs
+      id: validate
+      shell: bash
+      run: |
+        if [ ! -f "${{ inputs.docker_compose_path }}" ]; then
+          echo "::error::Docker compose file not found: ${{ inputs.docker_compose_path }}"
+          exit 1
+        fi
+
+    - name: Create shared directory and config
+      id: setup
+      shell: bash
+      run: |
+        # Create unique shared directory
+        SHARE_DIR="/tmp/tdx-share-$(uuidgen)"
+        mkdir -p "$SHARE_DIR"
+        echo "share_dir=$SHARE_DIR" >> $GITHUB_OUTPUT
+        echo "Created share directory: $SHARE_DIR"
+
+        # Compute compose hash
+        COMPOSE_HASH=$(sha256sum "${{ inputs.docker_compose_path }}" | awk '{print $1}')
+        echo "compose_hash=$COMPOSE_HASH" >> $GITHUB_OUTPUT
+
+        # Copy compose file and its directory contents to shared directory
+        COMPOSE_PATH="${{ inputs.docker_compose_path }}"
+        COMPOSE_DIR=$(cd "$(dirname "$COMPOSE_PATH")" && pwd)
+        cp "$COMPOSE_PATH" "$SHARE_DIR/docker-compose.yml"
+
+        # Copy files needed for docker build (Dockerfile, app/, src/, etc)
+        echo "Copying files from $COMPOSE_DIR to $SHARE_DIR..."
+        for f in "$COMPOSE_DIR"/*; do
+          FNAME=$(basename "$f")
+          # Skip files we don't need
+          [[ "$FNAME" == "docker-compose.yml" ]] && continue
+          [[ "$FNAME" == ".git" ]] && continue
+          [[ "$FNAME" == ".github" ]] && continue
+          [[ "$FNAME" == "node_modules" ]] && continue
+          [[ "$FNAME" == "__pycache__" ]] && continue
+
+          if [ -f "$f" ]; then
+            cp "$f" "$SHARE_DIR/"
+            echo "  Copied file: $FNAME"
+          elif [ -d "$f" ]; then
+            cp -r "$f" "$SHARE_DIR/"
+            echo "  Copied dir: $FNAME/"
+          fi
+        done
+        echo "Done copying files to $SHARE_DIR/"
+        ls -la "$SHARE_DIR/"
+
+        # Write config.json for VM (no repo clone needed - compose file in share dir)
+        cat > "$SHARE_DIR/config.json" << EOF
+        {
+          "intel_api_key": "${{ inputs.intel_api_key }}",
+          "intel_api_url": "${{ inputs.intel_api_url }}",
+          "compose_up_args": "${{ inputs.compose_up_args }}",
+          "health_endpoint": "${{ inputs.health_endpoint }}"
+        }
+        EOF
+
+        echo "Config written to $SHARE_DIR/config.json"
+
+    - name: Launch TDX VM
+      id: launch
+      shell: bash
+      run: |
+        SHARE_DIR="${{ steps.setup.outputs.share_dir }}"
+
+        IMAGE_PATH="${{ inputs.image_path }}"
+        if [ -z "$IMAGE_PATH" ]; then
+          for path in \
+            "${GITHUB_WORKSPACE}/vm_images/output/tdx-runner.qcow2" \
+            "${TDX_IMAGE_PATH:-/var/lib/tdx/images/tdx-runner.qcow2}" \
+            "$HOME/tdx/guest-tools/image/tdx-guest-ubuntu-24.04-generic.qcow2"; do
+            if [ -f "$path" ]; then
+              IMAGE_PATH="$path"
+              break
+            fi
+          done
+        fi
+
+        if [ ! -f "$IMAGE_PATH" ]; then
+          echo "::error::TDX image not found"
+          exit 1
+        fi
+
+        # Use our modified tdvirsh with virtio-fs support
+        TDVIRSH="${GITHUB_WORKSPACE}/vm_images/guest-tools/tdvirsh"
+        if [ ! -f "$TDVIRSH" ]; then
+          TDVIRSH="${GITHUB_WORKSPACE}/deps/tdx/guest-tools/tdvirsh"
+        fi
+        if [ ! -f "$TDVIRSH" ]; then
+          TDVIRSH="$(which tdvirsh 2>/dev/null || echo '')"
+        fi
+        if [ -z "$TDVIRSH" ] || [ ! -f "$TDVIRSH" ]; then
+          echo "::error::tdvirsh not found"
+          exit 1
+        fi
+
+        echo "Launching TDX VM with shared directory: $SHARE_DIR"
+        VM_OUTPUT=$("$TDVIRSH" new -i "$IMAGE_PATH" --share-dir "$SHARE_DIR" 2>&1) || {
+          echo "::error::Failed to launch TDX VM: $VM_OUTPUT"
+          exit 1
+        }
+
+        VM_NAME=$(echo "$VM_OUTPUT" | grep -oP 'Name:\s+\K\S+' | head -1)
+        if [ -z "$VM_NAME" ]; then
+          VM_NAME=$(echo "$VM_OUTPUT" | grep -oP 'tdvirsh-\S+' | head -1)
+        fi
+
+        echo "vm_name=$VM_NAME" >> $GITHUB_OUTPUT
+        echo "$VM_NAME" > /tmp/measure_tdx_vm_name.txt
+        echo "$SHARE_DIR" > /tmp/measure_tdx_share_dir.txt
+
+        echo "TDX VM launched: $VM_NAME"
+
+    - name: Wait for attestation
+      id: wait
+      shell: bash
+      run: |
+        SHARE_DIR="${{ steps.setup.outputs.share_dir }}"
+        TIMEOUT_SECS=$(( ${{ inputs.timeout_minutes }} * 60 ))
+        START_TIME=$(date +%s)
+
+        echo "Waiting for attestation (no network required)..."
+        echo "Polling $SHARE_DIR for status and attestation..."
+
+        while true; do
+          CURRENT_TIME=$(date +%s)
+          ELAPSED=$((CURRENT_TIME - START_TIME))
+
+          if [ $ELAPSED -gt $TIMEOUT_SECS ]; then
+            echo "::error::Timeout waiting for attestation"
+            if [ -f "$SHARE_DIR/error.log" ]; then
+              echo "Error log:"
+              cat "$SHARE_DIR/error.log"
+            fi
+            exit 1
+          fi
+
+          # Check for error
+          if [ -f "$SHARE_DIR/error.log" ]; then
+            echo "::error::Workload failed:"
+            cat "$SHARE_DIR/error.log"
+            exit 1
+          fi
+
+          # Check for attestation
+          if [ -f "$SHARE_DIR/attestation.json" ]; then
+            echo "Attestation received!"
+            ATTESTATION=$(cat "$SHARE_DIR/attestation.json")
+            echo "attestation_json=$(echo "$ATTESTATION" | jq -c '.')" >> $GITHUB_OUTPUT
+
+            echo "Attestation response:"
+            echo "$ATTESTATION" | jq . 2>/dev/null || echo "$ATTESTATION"
+            break
+          fi
+
+          # Show status
+          STATUS=$(cat "$SHARE_DIR/status" 2>/dev/null || echo "booting")
+          echo "Status: $STATUS (elapsed: ${ELAPSED}s)"
+
+          sleep 5
+        done
+
+    - name: Cleanup VM
+      if: always()
+      shell: bash
+      run: |
+        if [ -f /tmp/measure_tdx_vm_name.txt ]; then
+          VM_NAME=$(cat /tmp/measure_tdx_vm_name.txt)
+
+          TDVIRSH="${GITHUB_WORKSPACE}/vm_images/guest-tools/tdvirsh"
+          if [ ! -f "$TDVIRSH" ]; then
+            TDVIRSH="${GITHUB_WORKSPACE}/deps/tdx/guest-tools/tdvirsh"
+          fi
+          if [ ! -f "$TDVIRSH" ]; then
+            TDVIRSH="$(which tdvirsh 2>/dev/null || echo '')"
+          fi
+
+          if [ -n "$TDVIRSH" ] && [ -f "$TDVIRSH" ]; then
+            "$TDVIRSH" delete "$VM_NAME" 2>/dev/null || true
+          else
+            virsh destroy "$VM_NAME" 2>/dev/null || true
+          fi
+
+          rm -f /tmp/measure_tdx_vm_name.txt
+        fi
+
+        # Cleanup shared directory
+        if [ -f /tmp/measure_tdx_share_dir.txt ]; then
+          SHARE_DIR=$(cat /tmp/measure_tdx_share_dir.txt)
+          rm -rf "$SHARE_DIR" 2>/dev/null || true
+          rm -f /tmp/measure_tdx_share_dir.txt
+        fi

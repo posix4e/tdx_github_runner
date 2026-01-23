@@ -1,0 +1,79 @@
+# Test workflow for launch-tdx action
+name: Test Launch TDX
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-launch:
+    runs-on: [self-hosted, tdx]
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup dependencies
+        run: |
+          ./scripts/setup_host.sh install
+          echo "$PWD/bin" >> $GITHUB_PATH
+
+      - name: Build or locate image
+        id: image
+        run: |
+          if [ -f "$GITHUB_WORKSPACE/vm_images/output/tdx-runner.qcow2" ]; then
+            echo "Using existing image from workspace"
+            echo "image_path=$GITHUB_WORKSPACE/vm_images/output/tdx-runner.qcow2" >> $GITHUB_OUTPUT
+          elif [ -f "/home/ubuntu/src/tdx_github_runner/vm_images/output/tdx-runner.qcow2" ]; then
+            echo "Using existing image from persistent path"
+            echo "image_path=/home/ubuntu/src/tdx_github_runner/vm_images/output/tdx-runner.qcow2" >> $GITHUB_OUTPUT
+          else
+            echo "Building customized image..."
+            ./vm_images/build_image.sh
+            echo "image_path=$GITHUB_WORKSPACE/vm_images/output/tdx-runner.qcow2" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run launch-tdx
+        id: launch
+        uses: ./.github/actions/launch-tdx
+        with:
+          vm_name: 'test-persistent-vm'
+          image_path: ${{ steps.image.outputs.image_path }}
+          vm_memory_gb: '4'
+          vm_cpus: '2'
+          skip_registration: 'true'  # No web admin running
+
+      - name: Verify VM is running
+        run: |
+          echo "Checking VM status..."
+          VM_NAME="${{ steps.launch.outputs.vm_name }}"
+          VM_IP="${{ steps.launch.outputs.vm_ip }}"
+
+          # Check VM is listed
+          virsh list --all | grep -q "$VM_NAME" && echo "VM is listed in virsh"
+
+          # Test SSH connection
+          sshpass -p '123456' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            tdx@$VM_IP "echo 'SSH connection successful'; docker --version; uptime"
+
+          echo "VM verification passed!"
+
+      - name: Display results
+        run: |
+          echo "VM ID: ${{ steps.launch.outputs.vm_id }}"
+          echo "VM Name: ${{ steps.launch.outputs.vm_name }}"
+          echo "VM IP: ${{ steps.launch.outputs.vm_ip }}"
+          echo ""
+          echo "VM is running persistently. To connect:"
+          echo "  sshpass -p '123456' ssh tdx@${{ steps.launch.outputs.vm_ip }}"
+
+      - name: Cleanup test VM
+        if: always()
+        run: |
+          echo "Cleaning up test VM..."
+          VM_NAME="${{ steps.launch.outputs.vm_name }}"
+          if [ -n "$VM_NAME" ]; then
+            virsh destroy "$VM_NAME" 2>/dev/null || true
+            echo "VM $VM_NAME destroyed"
+          fi
