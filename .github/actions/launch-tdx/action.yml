@@ -96,17 +96,25 @@ runs:
         echo "share_dir=$SHARE_DIR" >> $GITHUB_OUTPUT
         echo "Created share directory: $SHARE_DIR"
 
-        # Copy compose file if provided
+        # Copy compose file and build context if provided
         if [ -n "${{ inputs.docker_compose_path }}" ]; then
           COMPOSE_DIR=$(dirname "${{ inputs.docker_compose_path }}")
-          cp "${{ inputs.docker_compose_path }}" "$SHARE_DIR/docker-compose.yml"
-          # Copy any additional files from compose directory (configs, etc)
-          if [ "$COMPOSE_DIR" != "." ]; then
-            for f in "$COMPOSE_DIR"/*; do
-              [ -f "$f" ] && [ "$(basename "$f")" != "docker-compose.yml" ] && cp "$f" "$SHARE_DIR/" 2>/dev/null || true
+
+          # Copy the entire directory to share dir for docker build context
+          if [ "$COMPOSE_DIR" = "." ]; then
+            # Compose file is in current directory, copy all files
+            for item in ./* ./.[!.]* ./..?*; do
+              [ -e "$item" ] || continue
+              [ "$(basename "$item")" = ".git" ] && continue
+              cp -r "$item" "$SHARE_DIR/" 2>/dev/null || true
             done
+          else
+            # Copy compose directory contents
+            cp -r "$COMPOSE_DIR"/* "$SHARE_DIR/" 2>/dev/null || true
+            cp "${{ inputs.docker_compose_path }}" "$SHARE_DIR/docker-compose.yml"
           fi
-          echo "Copied compose file and configs to $SHARE_DIR/"
+          echo "Copied compose file and build context to $SHARE_DIR/"
+          ls -la "$SHARE_DIR/"
         fi
 
         # Write config.json for persistent mode (no health check or attestation)
