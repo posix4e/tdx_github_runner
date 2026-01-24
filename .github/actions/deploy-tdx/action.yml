@@ -310,44 +310,59 @@ runs:
 
         echo "Waiting for attestation file..."
 
-        # Wait up to 60 seconds for attestation after ready
-        for i in {1..30}; do
+        # Wait up to 120 seconds for attestation
+        FOUND=false
+        for i in {1..60}; do
           if [ -f "$ATTESTATION_FILE" ]; then
             echo "Attestation file found after $((i * 2)) seconds"
+            FOUND=true
             break
+          fi
+          # Check for errors
+          if [ -f "$SHARE_DIR/error.log" ]; then
+            echo "::error::VM reported error during attestation:"
+            cat "$SHARE_DIR/error.log"
+            exit 1
           fi
           sleep 2
         done
 
-        # Extract attestation data
-        MRTD=""
-        ITA_TOKEN=""
-        ATTESTATION_JSON=""
-
-        if [ -f "$ATTESTATION_FILE" ]; then
-          echo "Reading attestation data..."
-          ATTESTATION_JSON=$(cat "$ATTESTATION_FILE")
-          echo "$ATTESTATION_JSON" | jq .
-
-          MRTD=$(echo "$ATTESTATION_JSON" | jq -r '.tdx.measurements.mrtd // empty')
-          ITA_TOKEN=$(echo "$ATTESTATION_JSON" | jq -r '.tdx.intel_ta_token // empty')
-
-          echo "mrtd=$MRTD" >> $GITHUB_OUTPUT
-          echo "ita_token=$ITA_TOKEN" >> $GITHUB_OUTPUT
-          echo "attestation_json=$(echo "$ATTESTATION_JSON" | jq -c '.')" >> $GITHUB_OUTPUT
-
-          echo "MRTD: ${MRTD:0:32}..."
-          if [ -n "$ITA_TOKEN" ]; then
-            echo "ITA Token: ${ITA_TOKEN:0:50}..."
-          else
-            echo "ITA Token: (not present)"
+        if [ "$FOUND" != "true" ]; then
+          echo "::error::Attestation file not found after 120 seconds"
+          echo "Share directory contents:"
+          ls -la "$SHARE_DIR/"
+          if [ -f "$SHARE_DIR/status" ]; then
+            echo "Status: $(cat "$SHARE_DIR/status")"
           fi
-        else
-          echo "::warning::Attestation file not found after 60 seconds"
-          echo "mrtd=" >> $GITHUB_OUTPUT
-          echo "ita_token=" >> $GITHUB_OUTPUT
-          echo "attestation_json=" >> $GITHUB_OUTPUT
+          exit 1
         fi
+
+        # Extract attestation data
+        echo "Reading attestation data..."
+        ATTESTATION_JSON=$(cat "$ATTESTATION_FILE")
+        echo "$ATTESTATION_JSON" | jq .
+
+        MRTD=$(echo "$ATTESTATION_JSON" | jq -r '.tdx.measurements.mrtd // empty')
+        ITA_TOKEN=$(echo "$ATTESTATION_JSON" | jq -r '.tdx.intel_ta_token // empty')
+
+        # Validate MRTD is present
+        if [ -z "$MRTD" ]; then
+          echo "::error::Attestation file exists but MRTD is empty"
+          echo "::error::This may indicate TDX quote generation failed"
+          exit 1
+        fi
+
+        echo "mrtd=$MRTD" >> $GITHUB_OUTPUT
+        echo "ita_token=$ITA_TOKEN" >> $GITHUB_OUTPUT
+        echo "attestation_json=$(echo "$ATTESTATION_JSON" | jq -c '.')" >> $GITHUB_OUTPUT
+
+        echo "MRTD: ${MRTD:0:32}..."
+        if [ -z "$ITA_TOKEN" ]; then
+          echo "::error::No Intel TA token in attestation"
+          echo "::error::Cannot register without valid attestation"
+          exit 1
+        fi
+        echo "ITA Token: ${ITA_TOKEN:0:50}..."
 
     - name: Register with EasyEnclave
       id: register
