@@ -10,7 +10,7 @@ back to the shared directory.
 
 Supports two modes:
 - "measure" (default): Run compose, wait for health check, generate attestation
-- "persistent": Run compose only, no health check or attestation (for long-running VMs)
+- "persistent": Run compose, optionally wait for health, generate attestation, stay running
 
 Attestation is handled at the VM level (not in workloads), so workloads
 only need to expose a /health endpoint.
@@ -428,9 +428,27 @@ def main():
             logger.info("No docker-compose.yml in share directory, skipping workload setup")
 
         if mode == "persistent":
-            # Persistent mode: just run compose, no health check or attestation
+            # Persistent mode: run compose and generate attestation, then stay running
+            # Wait for health check if health_endpoint is configured
+            health_status = {"status": "unknown"}
+            if config.get("health_endpoint") or config.get("health_url"):
+                try:
+                    health_status = wait_for_health(config)
+                except Exception as e:
+                    logger.warning(f"Health check failed in persistent mode: {e}")
+                    health_status = {"status": "unhealthy", "error": str(e)}
+
+            # Generate attestation even in persistent mode
+            if config.get("intel_api_key"):
+                try:
+                    attestation = get_tdx_attestation(config, health_status)
+                    ATTESTATION_FILE.write_text(json.dumps(attestation, indent=2))
+                    logger.info(f"Attestation written to {ATTESTATION_FILE}")
+                except Exception as e:
+                    logger.warning(f"Attestation generation failed: {e}")
+
             write_status("ready")
-            logger.info("Persistent mode: VM is ready (no attestation)")
+            logger.info("Persistent mode: VM is ready")
             # Keep running indefinitely for persistent VMs
             while True:
                 time.sleep(60)
