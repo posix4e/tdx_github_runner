@@ -390,20 +390,33 @@ runs:
         echo "$PAYLOAD" | jq .
 
         # Register with EasyEnclave
-        RESPONSE=$(curl -s -X POST "${{ inputs.easyenclave_api_url }}/api/v1/register" \
+        HTTP_CODE=$(curl -s -w "%{http_code}" -o /tmp/register_response.json \
+          -X POST "${{ inputs.easyenclave_api_url }}/api/v1/register" \
           -H "Content-Type: application/json" \
           -d "$PAYLOAD")
 
+        RESPONSE=$(cat /tmp/register_response.json)
+
+        echo "HTTP Status: $HTTP_CODE"
         echo "Response:"
         echo "$RESPONSE" | jq . 2>/dev/null || echo "$RESPONSE"
 
+        # Check HTTP status
+        if [[ ! "$HTTP_CODE" =~ ^2 ]]; then
+          echo "::error::Registration failed with HTTP $HTTP_CODE"
+          echo "::error::Response: $RESPONSE"
+          exit 1
+        fi
+
+        # Check for service_id in response
         SERVICE_ID=$(echo "$RESPONSE" | jq -r '.service_id // empty')
         if [ -n "$SERVICE_ID" ]; then
           echo "service_id=$SERVICE_ID" >> $GITHUB_OUTPUT
           echo "Successfully registered with service ID: $SERVICE_ID"
         else
-          echo "::warning::Registration may have failed - no service_id in response"
-          echo "service_id=" >> $GITHUB_OUTPUT
+          echo "::error::Registration failed - no service_id in response"
+          echo "::error::Response: $RESPONSE"
+          exit 1
         fi
 
     - name: Summary
